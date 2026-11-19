@@ -1,0 +1,13 @@
+tests
+__pycache__
+*.pyc
+.pytest_cache
+.git
+README.md
+docs
+.github
+CHANGELOG.md
+THIRD_PARTY.md
+LICENSE
+.env
+.env.example

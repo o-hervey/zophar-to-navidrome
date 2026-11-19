@@ -1,0 +1,16 @@
+name: tests
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image (fails if ffmpeg has no libgme)
+        run: docker build -t zophar-fetch:test .
+      - name: Run tests inside the image
+        run: >
+          docker run --rm -v "$PWD/tests:/srv/tests:ro" --entrypoint sh zophar-fetch:test
+          -c "pip install -q pytest httpx && python -m pytest -p no:cacheprovider /srv/tests"

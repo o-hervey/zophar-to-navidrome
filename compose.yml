@@ -1,0 +1,65 @@
+# Portainer stack. Set these in the stack's environment variables:
+#   MUSIC_DIR  host path of the (new, empty-or-existing) music folder, e.g. /mnt/mergerfs/storage/music
+#   APPDATA    host path for config, e.g. /opt/stacks/music
+#   PUID / PGID  owner of MUSIC_DIR on the host
+#   ND_USER / ND_PASS  the Navidrome admin you create on first visit (used only to trigger rescans)
+#   FETCH_BIND / NAVIDROME_BIND  host address each web UI listens on. Set to this VM's Tailscale IP
+#                      (100.x.x.x, from `tailscale ip -4`). Both default to 127.0.0.1, i.e. closed to the network.
+#   FETCH_PORT  host port for the fetcher page (default 8085; 8080 is taken by qBittorrent/Gluetun on VM04)
+#   NAVIDROME_TAG  optional: pin a Navidrome version (default latest)
+services:
+  # Runs once, as root, so the bind-mounted folders exist and belong to PUID:PGID. Without this Docker creates
+  # missing host folders as root and neither app below can write to them.
+  init:
+    image: alpine:3.20
+    restart: "no"
+    command:
+      - sh
+      - -c
+      - >
+        mkdir -p /appdata/navidrome /appdata/fetch /music/Zophar &&
+        chown -R ${PUID}:${PGID} /appdata/navidrome /appdata/fetch /music/Zophar
+    volumes:
+      - ${APPDATA}:/appdata
+      - ${MUSIC_DIR}:/music
+
+  navidrome:
+    image: deluan/navidrome:${NAVIDROME_TAG:-latest}
+    user: "${PUID}:${PGID}"
+    restart: unless-stopped
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    ports: ["${NAVIDROME_BIND:-127.0.0.1}:4533:4533"]
+    environment:
+      ND_SCANSCHEDULE: "@every 6h"       # fetcher triggers scans itself; this is just a safety net
+      ND_LOGLEVEL: info
+      ND_SESSIONTIMEOUT: 24h
+    volumes:
+      - ${APPDATA}/navidrome:/data
+      - ${MUSIC_DIR}:/music:ro           # Navidrome can never modify the music
+
+  zophar-fetch:
+    image: zophar-fetch:local          # built on the host first, see README
+    user: "${PUID}:${PGID}"
+    restart: unless-stopped
+    depends_on:
+      init:
+        condition: service_completed_successfully
+      navidrome:
+        condition: service_started
+    ports: ["${FETCH_BIND:-127.0.0.1}:${FETCH_PORT:-8085}:8080"]   # no login on this page: keep it Tailscale-only
+    environment:
+      MUSIC_ROOT: /music/Zophar
+      DATA_DIR: /data
+      ND_URL: http://navidrome:4533
+      ND_USER: ${ND_USER}
+      ND_PASS: ${ND_PASS}
+      OUTPUT_FORMAT: flac                # or opus (~10x smaller)
+      TRACK_SECONDS: "180"
+      COVER: "1"                         # save cover art from the game page (0 = off)
+      PREFER: auto                       # auto | mp3
+      # WORK_DIR: /data                  # temp space, ~3x the largest zip
+    volumes:
+      - ${APPDATA}/fetch:/data
+      - ${MUSIC_DIR}:/music              # writes ONLY under /music/Zophar (see MUSIC_ROOT)
