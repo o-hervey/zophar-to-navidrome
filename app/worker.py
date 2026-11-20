@@ -43,7 +43,7 @@ def _source_order(g: zophar.GamePage, page_url: str) -> list[str]:
     return [k for k in order if k in have and (k == "mp3" or gme_ok)]
 
 
-def _fetch_and_convert(kind: str, url: str, album: Album, jid: int) -> int:
+def _fetch_and_convert(kind: str, url: str, album: Album, jid: int, force: bool = False, keep_all: bool = False) -> int:
     db.run("UPDATE jobs SET status='downloading', detail=? WHERE id=?", (f"{kind} zip", jid))
     with tempfile.TemporaryDirectory(dir=C.WORK_DIR) as tmp:
         tmp = Path(tmp)
@@ -57,17 +57,19 @@ def _fetch_and_convert(kind: str, url: str, album: Album, jid: int) -> int:
         db.run("UPDATE jobs SET status='converting' WHERE id=?", (jid,))
         conv = convert_emu if kind == "emu" else convert_mp3
         return conv(tmp / "x", album, C.MUSIC_ROOT,
-                    progress=lambda k: db.run("UPDATE jobs SET tracks=? WHERE id=?", (k, jid)))
+                    progress=lambda k: db.run("UPDATE jobs SET tracks=? WHERE id=?", (k, jid)),
+                    replace=force, keep_all=keep_all)
 
 
 def _process(jid: int) -> str:
-    job = db.one("SELECT url,title,system FROM jobs WHERE id=?", (jid,))
-    db.run("UPDATE jobs SET status='downloading', detail='reading game page' WHERE id=?", (jid,))
+    job = db.one("SELECT url,title,system,force,keep_all FROM jobs WHERE id=?", (jid,))
+    force, keep_all = bool(job["force"]), bool(job["keep_all"])
+    db.run("UPDATE jobs SET detail='reading game page' WHERE id=?", (jid,))
     g = zophar.get_game(job["url"])
     album = Album(title=natural_title(g.title or job["title"]), system=g.system or job["system"],
                   year=g.year, developer=g.developer)
     dest = album_dir(album, C.MUSIC_ROOT)
-    if dest.is_dir() and any(dest.iterdir()):
+    if not force and dest.is_dir() and any(dest.iterdir()):
         db.run("UPDATE jobs SET tracks=? WHERE id=?", (sum(1 for _ in dest.iterdir()), jid))
         return "already in library"          # skip the 300 MB download
     order = _source_order(g, job["url"])
@@ -76,7 +78,7 @@ def _process(jid: int) -> str:
     last_err = None
     for kind in order:
         try:
-            _fetch_and_convert(kind, g.downloads[kind][0], album, jid)
+            _fetch_and_convert(kind, g.downloads[kind][0], album, jid, force, keep_all)
             break
         except NoPlayableFiles as e:   # e.g. EMU zip had nothing libgme can play: try the MP3s
             last_err = e
@@ -104,12 +106,20 @@ def _process(jid: int) -> str:
     return "; ".join(n for n in notes + [scan] if n)
 
 
+def _claim(jid: int) -> bool:
+    """Take a job off the queue. False if it was cancelled while waiting, or was queued twice and already ran."""
+    return bool(db.run("UPDATE jobs SET status='downloading', detail='starting' WHERE id=? AND status='queued'",
+                       (jid,)).rowcount)
+
+
 def _loop():
     while True:
         jid = jobs.get()
+        if not _claim(jid):
+            continue
         try:
             note = _process(jid)
-            db.run("UPDATE jobs SET status='done', detail=? WHERE id=?", (note, jid))
+            db.run("UPDATE jobs SET status='done', detail=?, force=0, keep_all=0 WHERE id=?", (note, jid))
         except Exception as e:
             log.exception("job %s failed", jid)
             db.run("UPDATE jobs SET status='failed', detail=? WHERE id=?", (str(e)[:500], jid))

@@ -360,3 +360,183 @@ def test_mp3_route_skips_short_tracks(tmp_path, monkeypatch):
         assert False
     except convert.NoPlayableFiles as e:
         assert "4 skipped" in str(e)
+
+
+# ---- queue view, cancel, redo -------------------------------------------------------------------------------
+
+def _clean_jobs():
+    from app import db
+    db.run("DELETE FROM jobs")
+
+
+def _job(db, url, status="queued", session="", **kw):
+    return db.run("INSERT INTO jobs(url,title,system,status,session,tracks) VALUES(?,?,?,?,?,?)",
+                  (url, kw.get("title", "Game"), "Nintendo NES", status, session, kw.get("tracks", 0))).lastrowid
+
+
+def test_old_database_gets_new_columns(tmp_path):
+    import sqlite3
+    from app import db
+    conn = sqlite3.connect(tmp_path / "old.db")
+    conn.execute("CREATE TABLE jobs(id INTEGER PRIMARY KEY, url TEXT UNIQUE, title TEXT, system TEXT, "
+                 "status TEXT DEFAULT 'queued', detail TEXT DEFAULT '', tracks INTEGER DEFAULT 0)")
+    conn.execute("INSERT INTO jobs(url,title,system,status) VALUES('u','T','S','done')")
+    db.migrate(conn)
+    db.migrate(conn)                                  # running it again is harmless
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(jobs)")}
+    assert {"session", "force", "keep_all"} <= cols
+    assert conn.execute("SELECT status,session FROM jobs").fetchone() == ("done", "")
+
+
+def test_queue_panel_is_scoped_to_the_browser_session(monkeypatch):
+    from fastapi.testclient import TestClient
+    from app import db, main
+    _clean_jobs()
+    mine = _job(db, "https://www.zophar.net/music/x/mine", "done", "S1", title="Mine Done")
+    _job(db, "https://www.zophar.net/music/x/other", "done", "S2", title="Other Done")
+    _job(db, "https://www.zophar.net/music/x/old", "done", "", title="Old Done")           # from before sessions existed
+    _job(db, "https://www.zophar.net/music/x/running", "converting", "S2", title="Other Running")
+    c = TestClient(main.app)
+    c.cookies.set("zf_session", "S1")
+    html = c.get("/queue").text
+    assert "Mine Done" in html and "Other Running" in html          # own history + anything in progress, from anyone
+    assert "Other Done" not in html and "Old Done" not in html
+    assert "2 earlier downloads not shown" in html
+    assert db.one("SELECT COUNT(*) n FROM jobs")["n"] == 4           # nothing was deleted
+    nocookie = TestClient(main.app).get("/queue").text               # a client with no session sees only active work
+    assert "Other Running" in nocookie and "Mine Done" not in nocookie
+    first = TestClient(main.app).get("/")
+    assert "zf_session" in first.headers["set-cookie"] and "max-age" not in first.headers["set-cookie"].lower()
+
+
+def test_search_status_ignores_session(monkeypatch):
+    from fastapi.testclient import TestClient
+    from app import db, main
+    _clean_jobs()
+    url = "https://www.zophar.net/music/nintendo-nes-nsf/zz"
+    _job(db, url, "done", "someone-else")
+    monkeypatch.setattr(zophar, "search", lambda q, c="0": [{"title": "ZZ", "system": "Nintendo NES", "year": "1990", "page_url": url}])
+    html = TestClient(main.app).post("/search", data={"q": "zz", "console": "0"}).text
+    assert "Done" in html and "Redo" in html
+
+
+def test_cancel_only_before_start(monkeypatch):
+    from fastapi.testclient import TestClient
+    from app import db, main, worker
+    _clean_jobs()
+    monkeypatch.setattr(main.worker.jobs, "put", lambda x: None)
+    waiting = _job(db, "https://www.zophar.net/music/x/w")
+    running = _job(db, "https://www.zophar.net/music/x/r", "downloading")
+    c = TestClient(main.app)
+    r = c.post(f"/cancel/{waiting}")
+    assert r.headers["hx-trigger"] == "refreshQueue" and ">Download<" in r.text      # offers the download again
+    c.post(f"/cancel/{running}")
+    st = {row["id"]: row["status"] for row in db.all_("SELECT id,status FROM jobs")}
+    assert st == {waiting: "cancelled", running: "downloading"}
+    assert worker._claim(waiting) is False                             # the worker skips it when it comes up
+
+
+def test_claim_runs_a_job_once(monkeypatch):
+    from app import db, worker
+    _clean_jobs()
+    jid = _job(db, "https://www.zophar.net/music/x/once")
+    assert worker._claim(jid) is True and worker._claim(jid) is False   # queued twice: the second copy is ignored
+
+
+def test_cancel_all_and_requeue_after_cancel(monkeypatch):
+    from fastapi.testclient import TestClient
+    from app import db, main
+    _clean_jobs()
+    queued = []
+    monkeypatch.setattr(main.worker.jobs, "put", queued.append)
+    a = _job(db, "https://www.zophar.net/music/x/a"); b = _job(db, "https://www.zophar.net/music/x/b")
+    run = _job(db, "https://www.zophar.net/music/x/c", "converting")
+    c = TestClient(main.app)
+    assert "Cancel all waiting" in c.get("/queue").text
+    c.post("/cancel_all")
+    assert [r["status"] for r in db.all_("SELECT status FROM jobs ORDER BY id")] == ["cancelled", "cancelled", "converting"]
+    r = c.post("/download", data={"url": "https://www.zophar.net/music/x/a", "title": "Game", "system": "Nintendo NES"})
+    assert "Queued" in r.text and queued == [a]                         # asking again re-queues the cancelled game
+    assert db.one("SELECT status FROM jobs WHERE id=?", (b,))["status"] == "cancelled"
+
+
+def test_redo_replaces_and_only_for_finished_jobs(monkeypatch):
+    from fastapi.testclient import TestClient
+    from app import db, main
+    _clean_jobs()
+    queued = []
+    monkeypatch.setattr(main.worker.jobs, "put", queued.append)
+    done = _job(db, "https://www.zophar.net/music/x/d", "done"); busy = _job(db, "https://www.zophar.net/music/x/e", "downloading")
+    c = TestClient(main.app)
+    c.post(f"/redo/{busy}", data={"keep_all": "1"})
+    assert queued == []                                                  # a running job can't be redone
+    c.post(f"/redo/{done}", data={"keep_all": "1"})
+    row = db.one("SELECT status,force,keep_all FROM jobs WHERE id=?", (done,))
+    assert tuple(row) == ("queued", 1, 1) and queued == [done]
+
+
+def test_publish_replace_swaps_album_and_restores_on_failure(tmp_path, monkeypatch):
+    album = convert.Album("Swap", "Nintendo NES", "1990", "")
+    root = tmp_path / "lib"
+    old = convert.album_dir(album, root); old.mkdir(parents=True); (old / "001 - Old.flac").write_text("old")
+    stage = tmp_path / "stage"; stage.mkdir(); (stage / "001 - New.flac").write_text("new")
+    try:
+        convert._publish(stage, album, root)                              # no replace: refuses, old album untouched
+        assert False
+    except FileExistsError:
+        assert (old / "001 - Old.flac").exists()
+    convert._publish(stage, album, root, replace=True)
+    assert [p.name for p in old.iterdir()] == ["001 - New.flac"]
+    assert not any(p.name.startswith(".") for p in old.parent.iterdir())    # no leftovers
+    stage2 = tmp_path / "stage2"; stage2.mkdir(); (stage2 / "001 - Newer.flac").write_text("x")
+    real_rename = Path.rename
+    def flaky(self, target):
+        if self.name.startswith(".incoming-"):
+            raise OSError("disk says no")
+        return real_rename(self, target)
+    monkeypatch.setattr(Path, "rename", flaky)
+    try:
+        convert._publish(stage2, album, root, replace=True)
+        assert False
+    except OSError:
+        pass
+    monkeypatch.undo()
+    assert [p.name for p in old.iterdir()] == ["001 - New.flac"]            # the album you had is back
+
+
+def test_keep_all_skips_the_filters(tmp_path, monkeypatch):
+    ex = tmp_path / "job" / "x"; ex.mkdir(parents=True)
+    make_nsf(ex / "a.nsf", songs=3)                                     # silent: the filters would drop every track
+    monkeypatch.setattr(convert.C, "MIN_TRACK_SECONDS", 20.0)
+    album = convert.Album("Keep", "Nintendo NES", "", "")
+    try:
+        convert.convert_emu(ex, album, tmp_path / "lib")
+        assert False
+    except convert.NoPlayableFiles:
+        pass
+    assert convert.convert_emu(ex, album, tmp_path / "lib", keep_all=True) == 3
+
+
+def test_worker_redo_downloads_again_and_replaces(tmp_path, monkeypatch):
+    from app import config as C, db, worker
+    mp3 = tmp_path / "t.mp3"
+    subprocess.run(["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", "sine=d=1", "-c:a", "libmp3lame", str(mp3)], check=True)
+    z = tmp_path / "mp3.zip"
+    with zipfile.ZipFile(z, "w") as zf:
+        zf.write(mp3, "Fresh Theme.mp3")
+    g = zophar.GamePage("Redo Game", "Nintendo 3DS", "2013", "Dev", "", {"mp3": ("https://fi.zophar.net/mp3.zip", "")})
+    got = []
+    monkeypatch.setattr(zophar, "get_game", lambda url: g)
+    monkeypatch.setattr(zophar, "download_file", lambda url, dest: (got.append(url), Path(dest).write_bytes(z.read_bytes())))
+    monkeypatch.setattr(C, "MUSIC_ROOT", tmp_path / "music")
+    monkeypatch.setattr(C, "COVER", False)
+    monkeypatch.setattr(worker, "trigger_scan", lambda: "")
+    album = tmp_path / "music" / "Nintendo 3DS" / "Redo Game"
+    album.mkdir(parents=True); (album / "001 - Stale.mp3").write_text("old")
+    url = "https://www.zophar.net/music/nintendo-3ds/redo-game"
+    plain = db.run("INSERT INTO jobs(url,title,system) VALUES(?,?,?)", (url, "Redo Game", "Nintendo 3DS")).lastrowid
+    assert worker._process(plain) == "already in library" and got == []          # a normal job skips the download
+    db.run("UPDATE jobs SET force=1 WHERE id=?", (plain,))
+    worker._process(plain)
+    assert got == ["https://fi.zophar.net/mp3.zip"]
+    assert sorted(p.name for p in album.iterdir()) == ["001 - Fresh Theme.mp3"]  # the old album was replaced

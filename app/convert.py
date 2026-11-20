@@ -294,30 +294,46 @@ def _tags(album: Album, title: str, n: int, artist: str = "", game: str = "") ->
     return tags
 
 
-def _publish(stage: Path, album: Album, album_root: Path) -> Path:
+def _publish(stage: Path, album: Album, album_root: Path, replace: bool = False) -> Path:
     """Move the finished album into place atomically: copy into a hidden sibling folder, then rename it.
-    Navidrome (and our own 'already in library' check) therefore never sees a half-written album."""
+    Navidrome (and our own 'already in library' check) therefore never sees a half-written album.
+    With replace=True an existing album is swapped out for the new one (the old one is only deleted once the
+    new one is in place, and put back if anything goes wrong)."""
     dest = album_dir(album, album_root)
     dest.parent.mkdir(parents=True, exist_ok=True)
+    old = dest.parent / f".old-{dest.name}"
     if dest.exists():
-        if any(dest.iterdir()):
+        if any(dest.iterdir()) and not replace:
             raise FileExistsError(f"{dest} already has files")
-        dest.rmdir()
+        if not any(dest.iterdir()):
+            dest.rmdir()
     tmp = dest.parent / f".incoming-{dest.name}"
     shutil.rmtree(tmp, ignore_errors=True)   # leftover from an interrupted run
     tmp.mkdir()
     try:
         for p in sorted(stage.iterdir()):
             shutil.move(str(p), tmp / p.name)
-        tmp.rename(dest)
+        shutil.rmtree(old, ignore_errors=True)
+        if dest.exists():
+            dest.rename(old)                 # replace: park the old album, swap, then delete it
+        try:
+            tmp.rename(dest)
+        except BaseException:
+            if old.exists() and not dest.exists():
+                old.rename(dest)             # put the old album back
+            raise
+        shutil.rmtree(old, ignore_errors=True)
     except BaseException:
         shutil.rmtree(tmp, ignore_errors=True)
         raise
     return dest
 
 
-def convert_emu(extract_dir: Path, album: Album, album_root: Path, progress=lambda n: None) -> int:
-    """Render original sound files (NSF/SPC/GBS/...) via ffmpeg+libgme. Returns track count."""
+def convert_emu(extract_dir: Path, album: Album, album_root: Path, progress=lambda n: None,
+                replace: bool = False, keep_all: bool = False) -> int:
+    """Render original sound files (NSF/SPC/GBS/...) via ffmpeg+libgme. Returns track count.
+    keep_all switches off the minimum-length, silence and loop filters; replace swaps out an existing album."""
+    min_s, max_loop = (0.0, 0.0) if keep_all else (C.MIN_TRACK_SECONDS, C.MAX_LOOP_SECONDS)
     files = sorted((f for f in extract_dir.rglob("*") if f.is_file() and f.suffix.lower() in C.GME_EXTS),
                    key=_natural)
     if not files:
@@ -338,16 +354,16 @@ def convert_emu(extract_dir: Path, album: Album, album_root: Path, progress=lamb
             name = titles.get(i) or (f"Track {i + 1}" if len(files) == 1 else f"{f.stem} - Track {i + 1}")
             length, fade = lengths.get(i), None
             try:
-                if C.MIN_TRACK_SECONDS > 0:
+                if min_s > 0:
                     planned, _ = plan_duration(length)
                     audible = probe_audible(f, i, planned)
-                    if audible < C.MIN_TRACK_SECONDS:
+                    if audible < min_s:
                         skipped += 1
                         continue   # a sound effect or jingle, not music worth a library entry
                     if audible < planned - 1:   # plays once and stops: end where the sound does
                         length, fade = audible + 1.5, 1.0
-                    elif C.MAX_LOOP_SECONDS > 0 and (
-                            period := short_loop_period(f, i, planned, C.MAX_LOOP_SECONDS)) is not None:
+                    elif max_loop > 0 and (
+                            period := short_loop_period(f, i, planned, max_loop)) is not None:
                         log.info("skipping %s track %d: sound repeats every %.1fs (an effect)", f.name, i + 1, period)
                         skipped += 1
                         continue
@@ -361,9 +377,9 @@ def convert_emu(extract_dir: Path, album: Album, album_root: Path, progress=lamb
             n += 1
             progress(n)
     if n == 0:
-        raise NoPlayableFiles(f"every track was shorter than {C.MIN_TRACK_SECONDS:g}s or silent "
+        raise NoPlayableFiles(f"every track was shorter than {min_s:g}s or silent "
                               f"({skipped} skipped)")
-    _publish(stage, album, album_root)
+    _publish(stage, album, album_root, replace)
     return n
 
 
@@ -377,7 +393,8 @@ def mp3_seconds(path: Path):
         return None
 
 
-def convert_mp3(extract_dir: Path, album: Album, album_root: Path, progress=lambda n: None) -> int:
+def convert_mp3(extract_dir: Path, album: Album, album_root: Path, progress=lambda n: None,
+                replace: bool = False, keep_all: bool = False) -> int:
     """Zophar's own MP3 renders: no re-encoding, just clean tags. Tracks shorter than MIN_TRACK_SECONDS
     (sound effects, jingles) are left out. Returns track count."""
     files = sorted((f for f in extract_dir.rglob("*.mp3") if f.is_file()), key=_natural)
@@ -385,9 +402,10 @@ def convert_mp3(extract_dir: Path, album: Album, album_root: Path, progress=lamb
         raise NoPlayableFiles("no MP3 files in the archive")
     stage = extract_dir.parent / "out"
     stage.mkdir(exist_ok=True)
+    min_s = 0.0 if keep_all else C.MIN_TRACK_SECONDS
     n = skipped = 0
     for f in files:
-        if C.MIN_TRACK_SECONDS > 0 and (secs := mp3_seconds(f)) is not None and secs < C.MIN_TRACK_SECONDS:
+        if min_s > 0 and (secs := mp3_seconds(f)) is not None and secs < min_s:
             skipped += 1
             continue
         name = tidy_track_name(f.stem)
@@ -403,8 +421,8 @@ def convert_mp3(extract_dir: Path, album: Album, album_root: Path, progress=lamb
         n += 1
         progress(n)
     if n == 0:
-        raise NoPlayableFiles(f"every MP3 was shorter than {C.MIN_TRACK_SECONDS:g}s ({skipped} skipped)")
-    _publish(stage, album, album_root)
+        raise NoPlayableFiles(f"every MP3 was shorter than {min_s:g}s ({skipped} skipped)")
+    _publish(stage, album, album_root, replace)
     return n
 
 

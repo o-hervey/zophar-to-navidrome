@@ -22,7 +22,7 @@ MAX_LOOP_SECONDS = float(os.environ.get("MAX_LOOP_SECONDS", "10"))
 OUTPUT_FORMAT = os.environ.get("OUTPUT_FORMAT", "flac").lower()
 
 BASE_URL = "https://www.zophar.net"
-USER_AGENT = "zophar-fetch/0.9.2 (self-hosted, personal use; one request per 2s)"
+USER_AGENT = "zophar-fetch/0.10.0 (self-hosted, personal use; one request per 2s)"
 MIN_REQUEST_INTERVAL = float(os.environ.get("MIN_REQUEST_INTERVAL", "2"))
 
 # Safety limits for untrusted archives.

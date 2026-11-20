@@ -1,8 +1,9 @@
 import json
+import secrets
 from html import escape
 from pathlib import Path
 
-from fastapi import FastAPI, Form
+from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -94,6 +95,20 @@ ul.q li:last-child{border-bottom:0}
 .meter.failed i{background:transparent;box-shadow:inset 0 0 0 1.5px var(--bad)}
 .stage.queued{color:var(--dim)}.stage.working{color:var(--work)}.stage.done{color:var(--ok)}.stage.failed{color:var(--bad)}
 .stage button{margin-left:auto;padding:.15rem .6rem;font-size:.85rem}
+.cell{display:flex;flex-direction:column;align-items:center;gap:.3rem}
+.cell>button{width:100%}
+button.quiet{padding:.1rem .6rem;font-size:.8rem;color:var(--dim)}
+.redo summary{cursor:pointer;color:var(--dim);font-size:.8rem;list-style:none;text-align:center;padding:.1rem .4rem;border-radius:6px}
+.redo summary::-webkit-details-marker{display:none}
+.redo summary:hover,.redo[open] summary{color:var(--ink);background:var(--hover)}
+.redo summary:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.redo-menu{display:flex;flex-direction:column;gap:.35rem;margin-top:.35rem}
+.redo-menu button{font-size:.8rem;padding:.3rem .5rem;width:100%}
+.qbar{display:flex;justify-content:space-between;align-items:center;padding:.5rem 1rem;border-bottom:1px solid var(--line)}
+.qbar button{padding:.15rem .6rem;font-size:.85rem}
+.stage{flex-wrap:wrap}.stage .redo{margin-left:auto}.stage .redo[open]{flex:1 0 100%}
+.stage.cancelled{color:var(--dim)}
+.note{padding:.6rem 1rem;color:var(--dim);font-size:.85rem}
 @keyframes pulse{50%{opacity:.35}}
 .htmx-indicator{opacity:0;transition:opacity .2s;align-self:center;color:var(--dim)}.htmx-request .htmx-indicator{opacity:1}
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
@@ -110,7 +125,7 @@ ul.q li:last-child{border-bottom:0}
 <span id=spin class=htmx-indicator>Searching&hellip;</span></form>
 <div class=layout>
 <main><div id="results"><div class="panel empty">Search for a game to see its soundtracks.</div></div></main>
-<aside><div class=panel><h2>Queue</h2><div id=queue hx-get="/queue" hx-trigger="load, every 3s"></div></div></aside>
+<aside><div class=panel><h2>Queue</h2><div id=queue hx-get="/queue" hx-trigger="load, every 3s, refreshQueue from:body"></div></div></aside>
 </div></div>"""
 PAGE = PAGE.replace("__ARROW__", _ARROW)
 
@@ -128,8 +143,11 @@ def _chip(system: str) -> str:
     return f"<span class=chip style='--h:{hue}'>{escape(system)}</span>"
 
 
+_ACTIVE = ("queued", "downloading", "converting")
 _STAGE = {"queued": 1, "downloading": 2, "converting": 3, "done": 4}
-_LABEL = {"queued": "Queued", "downloading": "Downloading", "converting": "Converting", "done": "Done", "failed": "Failed"}
+_LABEL = {"queued": "Queued", "downloading": "Downloading", "converting": "Converting", "done": "Done",
+          "failed": "Failed", "cancelled": "Cancelled"}
+_REFRESH = {"HX-Trigger": "refreshQueue"}   # tells the queue panel to update straight away
 
 
 def _meter(st: str) -> str:
@@ -137,22 +155,72 @@ def _meter(st: str) -> str:
     return f"<span class='meter {cls}' data-n='{_STAGE.get(st, 0)}'><i></i><i></i><i></i><i></i></span>"
 
 
-def _status_cell(job, r):
-    """What goes in the action column: a button, or the job's status in the same place."""
-    if job is None:
-        vals = escape(json.dumps({"url": r["page_url"], "title": r["title"], "system": r["system"]}), quote=True)
-        return f"<button class=primary hx-post='/download' hx-vals='{vals}' hx-swap='outerHTML'>Download</button>"
-    st = job["status"]
+def _session(request: Request) -> str:
+    return request.cookies.get("zf_session", "")
+
+
+def _redo_menu(jid: int, in_cell: bool) -> str:
+    """Redo choices, shown for finished games. They replace the existing album, so they ask first."""
+    target = "hx-target='closest .cell' hx-swap='outerHTML'" if in_cell else "hx-swap='none'"
+
+    def btn(label: str, keep_all: int, ask: str) -> str:
+        return (f"<button hx-post='/redo/{jid}' hx-vals='{{\"keep_all\": \"{keep_all}\"}}' {target} "
+                f"hx-confirm='{ask}'>{label}</button>")
+
+    return ("<details class=redo><summary>Redo</summary><div class=redo-menu>"
+            + btn("Download again", 0, "Download again and replace the album in your library?")
+            + btn("Again, keep all tracks", 1, "Download again with no track filtering and replace the album in your library?")
+            + "</div></details>")
+
+
+def _cell(job, r=None) -> str:
+    """The action column for one game: a Download button, or its status (kept current while it is running)."""
+    if job is None or job["status"] == "cancelled":
+        src = r if r is not None else {"page_url": job["url"], "title": job["title"], "system": job["system"]}
+        vals = escape(json.dumps({"url": src["page_url"], "title": src["title"], "system": src["system"]}), quote=True)
+        return (f"<div class=cell><button class=primary hx-post='/download' hx-vals='{vals}' "
+                f"hx-target='closest .cell' hx-swap='outerHTML'>Download</button></div>")
+    st, jid = job["status"], job["id"]
     if st == "failed":
-        return (f"<button class=retry hx-post='/retry/{job['id']}' hx-swap='outerHTML' "
-                f"title='{escape(job['detail'])}'>Retry</button>")
-    cls = {"queued": "queued", "done": "done"}.get(st, "working")
-    return f"<span class='st {cls}'>{_LABEL.get(st, st)}</span>"
+        return (f"<div class=cell><button class=retry hx-post='/retry/{jid}' hx-target='closest .cell' "
+                f"hx-swap='outerHTML' title='{escape(job['detail'])}'>Retry</button></div>")
+    if st == "done":
+        return f"<div class=cell><span class='st done'>Done</span>{_redo_menu(jid, True)}</div>"
+    poll = f"hx-get='/cell/{jid}' hx-trigger='every 4s' hx-swap='outerHTML'"
+    if st == "queued":
+        return (f"<div class=cell {poll}><span class='st queued'>Queued</span>"
+                f"<button class=quiet hx-post='/cancel/{jid}' hx-target='closest .cell' hx-swap='outerHTML'>Cancel</button></div>")
+    return f"<div class=cell {poll}><span class='st working'>{_LABEL.get(st, st)}</span></div>"
+
+
+def _enqueue(url: str, title: str, system: str, session: str):
+    """Queue a game. Returns the job id, or None if it is already queued, running, done or failed."""
+    cur = db.run("INSERT OR IGNORE INTO jobs(url,title,system,session) VALUES(?,?,?,?)", (url, title, system, session))
+    if cur.rowcount:
+        jid = cur.lastrowid
+    else:   # a cancelled request can simply be asked for again
+        if not db.run("UPDATE jobs SET status='queued', detail='', tracks=0, session=?, force=0, keep_all=0 "
+                      "WHERE url=? AND status='cancelled'", (session, url)).rowcount:
+            return None
+        jid = db.one("SELECT id FROM jobs WHERE url=?", (url,))["id"]
+    worker.jobs.put(jid)
+    return jid
+
+
+def _job(jid: int):
+    return db.one("SELECT id,url,title,system,status,detail,tracks FROM jobs WHERE id=?", (jid,))
+
+
+def _html(body: str) -> HTMLResponse:
+    return HTMLResponse(body, headers=_REFRESH)
 
 
 @app.get("/", response_class=HTMLResponse)
-def index():
-    return PAGE.replace("__CONSOLES__", _OPTIONS)
+def index(request: Request):
+    resp = HTMLResponse(PAGE.replace("__CONSOLES__", _OPTIONS))
+    if not _session(request):   # no expiry: a cookie that lasts until the browser is closed
+        resp.set_cookie("zf_session", secrets.token_hex(8), httponly=True, samesite="lax")
+    return resp
 
 
 @app.post("/search", response_class=HTMLResponse)
@@ -165,8 +233,8 @@ def search(q: str = Form(...), console: str = Form("0")):
     if not found:
         return f"<div class='panel empty'>No soundtracks match &ldquo;{escape(q)}&rdquo;. Try a shorter name or another console.</div>"
     marks = ",".join("?" * len(found))
-    jobs = {j["url"]: j for j in db.all_(f"SELECT id,url,status,detail FROM jobs WHERE url IN ({marks})",
-                                          [r["page_url"] for r in found])}
+    jobs = {j["url"]: j for j in db.all_(
+        f"SELECT id,url,title,system,status,detail FROM jobs WHERE url IN ({marks})", [r["page_url"] for r in found])}
     twins = {}
     for r in found:
         twins[(r["title"], r["system"])] = twins.get((r["title"], r["system"]), 0) + 1
@@ -178,7 +246,7 @@ def search(q: str = Form(...), console: str = Form("0")):
         rows.append(f"<tr><td>{escape(r['title'])}{hint}"
                     f"<span class=meta>{_chip(r['system'])}<span class=msg>{escape(r['year'])}</span></span></td>"
                     f"<td class=console>{_chip(r['system'])}</td><td class=year>{escape(r['year'])}</td>"
-                    f"<td class=act>{_status_cell(jobs.get(r['page_url']), r)}</td></tr>")
+                    f"<td class=act>{_cell(jobs.get(r['page_url']), r)}</td></tr>")
     bar = f"<div class=bar><span class=msg>{len(found)} results</span>"
     if len(found) > 1:
         vals = escape(json.dumps({"q": q, "console": console}), quote=True)
@@ -190,49 +258,104 @@ def search(q: str = Form(...), console: str = Form("0")):
 
 
 @app.post("/download_all", response_class=HTMLResponse)
-def download_all(q: str = Form(...), console: str = Form("0")):
+def download_all(request: Request, q: str = Form(...), console: str = Form("0")):
     try:
         found = zophar.search(q, console if console in zophar.CONSOLES else "0")[: C.MAX_BATCH]
     except Exception as e:
         return f"<span class=failed>Search failed: {escape(str(e))}</span>"
-    new = 0
-    for r in found:
-        cur = db.run("INSERT OR IGNORE INTO jobs(url,title,system) VALUES(?,?,?)", (r["page_url"], r["title"], r["system"]))
-        if cur.rowcount:
-            worker.jobs.put(cur.lastrowid)
-            new += 1
-    return f"<span class=msg>Queued {new} new ({len(found) - new} already requested). Refresh the search to see status.</span>"
+    new = sum(1 for r in found if _enqueue(r["page_url"], r["title"], r["system"], _session(request)))
+    vals = escape(json.dumps({"q": q, "console": console}), quote=True)
+    return _html(f"<span class=msg>Queued {new} new ({len(found) - new} already requested).</span> "
+                 f"<button hx-post='/search' hx-vals='{vals}' hx-target='#results'>Show status</button>")
 
 
 @app.post("/download", response_class=HTMLResponse)
-def download(url: str = Form(...), title: str = Form(...), system: str = Form(...)):
+def download(request: Request, url: str = Form(...), title: str = Form(...), system: str = Form(...)):
     if not zophar.is_zophar_url(url):
-        return "<span class='st failed'>Refused</span>"
-    cur = db.run("INSERT OR IGNORE INTO jobs(url,title,system) VALUES(?,?,?)", (url, title, system))
-    if cur.rowcount:
-        worker.jobs.put(cur.lastrowid)
-        return "<span class='st queued'>Queued</span>"
-    return "<span class='st queued'>Already requested</span>"
+        return "<div class=cell><span class='st failed'>Refused</span></div>"
+    _enqueue(url, title, system, _session(request))
+    return _html(_cell(db.one("SELECT id,url,title,system,status,detail FROM jobs WHERE url=?", (url,))))
+
+
+@app.get("/cell/{jid}", response_class=HTMLResponse)
+def cell(jid: int):
+    job = _job(jid)
+    return _cell(job) if job else ""
+
+
+@app.post("/cancel/{jid}", response_class=HTMLResponse)
+def cancel(jid: int):
+    # Only a job that has not started can be cancelled; the worker claims jobs with the same status check.
+    db.run("UPDATE jobs SET status='cancelled', detail='' WHERE id=? AND status='queued'", (jid,))
+    job = _job(jid)
+    return _html(_cell(job) if job else "")
+
+
+@app.post("/cancel_all", response_class=HTMLResponse)
+def cancel_all():
+    db.run("UPDATE jobs SET status='cancelled', detail='' WHERE status='queued'")
+    return _html("")
 
 
 @app.post("/retry/{jid}", response_class=HTMLResponse)
-def retry(jid: int):
-    cur = db.run("UPDATE jobs SET status='queued', detail='' WHERE id=? AND status='failed'", (jid,))
+def retry(request: Request, jid: int):
+    cur = db.run("UPDATE jobs SET status='queued', detail='', session=? WHERE id=? AND status='failed'",
+                 (_session(request), jid))
     if cur.rowcount:   # a double-click or a stale page must not queue the same job twice
         worker.jobs.put(jid)
-    return "<span class='st queued'>Queued</span>"
+    job = _job(jid)
+    return _html(_cell(job) if job else "")
+
+
+@app.post("/redo/{jid}", response_class=HTMLResponse)
+def redo(request: Request, jid: int, keep_all: str = Form("0")):
+    """Download a game again even though it is already in the library, replacing the album."""
+    cur = db.run("UPDATE jobs SET status='queued', detail='', tracks=0, force=1, keep_all=?, session=? "
+                 "WHERE id=? AND status IN ('done','failed','cancelled')", (1 if keep_all == "1" else 0, _session(request), jid))
+    if cur.rowcount:
+        worker.jobs.put(jid)
+    job = _job(jid)
+    return _html(_cell(job) if job else "")
+
+
+def _queue_item(r) -> str:
+    st = r["status"]
+    cls = "working" if st in ("downloading", "converting") else st
+    tracks = f"<span class=hint>{r['tracks']} tracks</span>" if r["tracks"] else ""
+    detail = f"<span class=hint>{escape(r['detail'])}</span>" if r["detail"] else ""
+    extra = ""
+    if st == "queued":
+        extra = f"<button class=quiet hx-post='/cancel/{r['id']}' hx-swap='none'>Cancel</button>"
+    elif st == "failed":
+        extra = f"<button class=retry hx-post='/retry/{r['id']}' hx-swap='none'>Retry</button>"
+    elif st == "done":
+        extra = _redo_menu(r["id"], False)
+    return (f"<li><div class=job><span class=t>{escape(natural_title(r['title']))}{tracks}{detail}</span>"
+            f"{_chip(r['system'])}</div>"
+            f"<div class='stage {cls}'>{_meter(st)}<span>{_LABEL.get(st, st)}</span>{extra}</div></li>")
 
 
 @app.get("/queue", response_class=HTMLResponse)
-def queue_view():
-    out = []
-    for r in db.all_("SELECT id,title,system,status,detail,tracks FROM jobs ORDER BY id DESC LIMIT 30"):
-        st = r["status"]
-        cls = "working" if st in ("downloading", "converting") else st
-        tracks = f"<span class=hint>{r['tracks']} tracks</span>" if r["tracks"] else ""
-        detail = f"<span class=hint>{escape(r['detail'])}</span>" if r["detail"] else ""
-        retry = f"<button class=retry hx-post='/retry/{r['id']}' hx-swap='outerHTML'>Retry</button>" if st == "failed" else ""
-        out.append(f"<li><div class=job><span class=t>{escape(natural_title(r['title']))}{tracks}{detail}</span>"
-                   f"{_chip(r['system'])}</div>"
-                   f"<div class='stage {cls}'>{_meter(st)}<span>{_LABEL.get(st, st)}</span>{retry}</div></li>")
-    return f"<ul class=q>{''.join(out) or '<li class=msg>Nothing queued yet. Downloads you start appear here.</li>'}</ul>"
+def queue_view(request: Request):
+    """The panel shows what is running or waiting (whoever started it) plus what this browser session has
+    started. Everything else is still in the database and still drives the status shown next to each game."""
+    cols = "id,title,system,status,detail,tracks"
+    active = db.all_(f"SELECT {cols} FROM jobs WHERE status IN ('queued','downloading','converting') ORDER BY id")
+    sess = _session(request)
+    finished = db.all_(f"SELECT {cols} FROM jobs WHERE session=? AND status NOT IN ('queued','downloading','converting') "
+                       f"ORDER BY id DESC LIMIT 100", (sess,)) if sess else []
+    hidden = db.one("SELECT COUNT(*) n FROM jobs WHERE status IN ('done','failed') AND session<>?", (sess,))["n"]
+    waiting = sum(1 for r in active if r["status"] == "queued")
+    bar = ""
+    if waiting > 1:
+        bar = (f"<div class=qbar><span class=msg>{waiting} waiting</span>"
+               f"<button class=quiet hx-post='/cancel_all' hx-swap='none' "
+               f"hx-confirm='Cancel all {waiting} waiting downloads?'>Cancel all waiting</button></div>")
+    items = "".join(_queue_item(r) for r in [*active, *finished])
+    if not items:
+        items = "<li class=msg>Nothing queued. Downloads you start appear here.</li>"
+    note = ""
+    if hidden:
+        note = (f"<div class=note>{hidden} earlier download{'s' if hidden != 1 else ''} not shown. "
+                f"Search for a game to see if it is already in your library.</div>")
+    return f"{bar}<ul class=q>{items}</ul>{note}"

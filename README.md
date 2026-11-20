@@ -25,7 +25,18 @@ game soundtrack into a tagged album for [Navidrome](https://www.navidrome.org):
   of them. If Zophar changes its HTML, only `app/zophar.py` should need touching.
 - Run end to end on a real home server: an NES game (original sound files, rendered with ffmpeg + libgme) and a 3DS game
   (Zophar's MP3s, retagged), with cover art and a Navidrome rescan.
-- 27 automated tests. They need ffmpeg with libgme, so run them in the image (see below); CI does this on every push.
+- 37 automated tests. They need ffmpeg with libgme, so run them in the image (see below); CI does this on every push.
+
+## Using it
+- **Queue panel.** It shows what is running or waiting (whoever started it) plus the downloads started in this browser
+  session. Closing the browser starts a fresh list. Nothing is deleted: every game's status is still remembered and shown
+  next to it in the search results, and a note under the queue says how many earlier downloads are not listed.
+- **Cancel.** A queued game has a Cancel button, and "Cancel all waiting" appears when several are queued. A download that
+  has already started can't be cancelled. A cancelled game can be queued again.
+- **Redo.** A finished game has a Redo menu: *Download again* repeats the job with the current settings, and *Again, keep
+  all tracks* skips the length, silence and loop filters (use it if a real track was dropped). Both replace the existing
+  album; the old one is only removed once the new one is complete. Navidrome greys out tracks whose files have gone, so
+  after a redo that changes file names, clear them under **Missing Files**.
 
 ## What it downloads
 Each Zophar game page offers two zips: the original sound files (EMU) and ready-made MP3s.
@@ -72,7 +83,7 @@ The build fails on purpose if the image's ffmpeg has no libgme. If it succeeds, 
 ```
 docker run --rm -v "$PWD/tests:/srv/tests:ro" --entrypoint sh zophar-fetch:local   -c "pip install -q pytest httpx && python -m pytest -p no:cacheprovider /srv/tests"
 ```
-All 27 should pass. If any fail, stop and fix that before deploying.
+All 37 should pass. If any fail, stop and fix that before deploying.
 
 **2. Configure**
 - Docker Compose: `cp .env.example .env` and edit it. `MUSIC_DIR`, `APPDATA`, `PUID`, `PGID` are required.

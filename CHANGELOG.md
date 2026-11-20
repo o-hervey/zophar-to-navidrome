@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.10.0
+- The queue panel shows only this browser session's downloads plus anything in progress; the job history is untouched
+  and still drives each game's status in the search results.
+- Cancel a queued download, or all waiting ones.
+- Redo a finished game, optionally keeping every track, replacing the existing album safely.
+- Status next to each game now updates itself while the download runs, and the queue refreshes as soon as you click.
+
 ## 0.9.2
 - Minimum-length filter (`MIN_TRACK_SECONDS`, default 20 s) now also applies to Zophar's MP3 downloads.
 
